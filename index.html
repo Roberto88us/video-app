@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quick Video Call</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3Ctext y='50' font-size='48'%3E%F0%9F%93%BA%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://unpkg.com">
+<style>
+  :root { --bg:#0b0f14; --card:#121923; --muted:#8aa0b2; --text:#eaf2f9; --accent:#4da3ff; }
+  *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;background:var(--bg);color:var(--text)}
+  .wrap{max-width:1100px;margin:0 auto;padding:16px}
+  header{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:14px 0 10px}
+  .brand{font-weight:700;letter-spacing:.2px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .card{background:var(--card);border:1px solid #1f2a38;border-radius:16px;padding:10px;position:relative;min-height:260px}
+  video{width:100%;height:58vh;min-height:260px;background:#0a0a0a;border-radius:12px;object-fit:cover}
+  .videos{grid-column:1/-1}
+  .row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .pill{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:999px;background:#0f1621;border:1px solid #1f2a38;color:var(--text);text-decoration:none}
+  button.pill{cursor:pointer}
+  .pill[disabled]{opacity:.6;cursor:not-allowed}
+  .small{font-size:.9rem;color:var(--muted)}
+  .linkbox{display:flex;gap:8px;align-items:center;background:#0f1621;border:1px solid #1f2a38;border-radius:12px;padding:10px 12px;overflow:auto}
+  .badge{display:inline-flex;align-items:center;gap:6px;background:#0f2033;border:1px solid #1f2a38;color:#c8e2ff;padding:6px 10px;border-radius:999px;font-size:.85rem}
+  /* New classes extracted from inline styles */
+  .video-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px}
+  .inner-card{min-height:200px;margin:10px}
+  .row-controls{margin:4px 0 10px}
+  .push-right{margin-left:auto}
+  .divider{border:0;border-top:1px solid #1f2a38;margin:12px 0}
+  .mb-6{margin-bottom:6px}
+  .nowrap{white-space:nowrap}
+  .section-title{margin:10px 10px 6px;text-align:center}
+  .hint{position:absolute;inset:auto 10px 10px 10px;color:#c9d8e0;font-size:.9rem;opacity:.9}
+  .status{font-variant-numeric:tabular-nums}
+  .toast{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);background:#07101a;color:#e8f2ff;border:1px solid #15314e;padding:10px 14px;border-radius:12px;display:none}
+  .footer{margin-top:12px;color:var(--muted);font-size:.9rem}
+  @media (max-width:920px){ .grid{grid-template-columns:1fr} video{height:50vh} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Quick Video Call</div>
+    <div class="row small">
+      <span class="badge" id="roleBadge">Role: <strong id="roleText">Host</strong></span>
+      <span class="badge">Status: <span class="status" id="statusText">Initializing…</span></span>
+      <span class="badge">ID: <span class="status" id="idText">—</span></span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card videos">
+      <div class="grid video-grid">
+        <div class="card inner-card">
+          <video id="localVideo" muted playsinline></video>
+          <div class="hint">You</div>
+        </div>
+        <div class="card inner-card">
+          <video id="remoteVideo" playsinline></video>
+          <div class="hint">Guest</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row row-controls">
+        <button class="pill push-right" id="btnStart" type="button">▶️ Join / Start</button>
+        <button class="pill" id="btnMic" type="button">🎙️ Mute</button>
+        <button class="pill" id="btnCam" type="button">🎥 Camera Off</button>
+        <button class="pill" id="btnHang" type="button">⛔ End Call</button>
+      </div>
+      <div class="small">Tip: Click <strong>Join / Start</strong> if autoplay is blocked or you arrived via an invite link.</div>
+      <hr class="divider">
+      <div class="small mb-6">Invite Link</div>
+      <div class="linkbox">
+        <code id="inviteLink" class="nowrap"></code>
+        <button class="pill" id="btnCopy" type="button">📋 Copy</button>
+      </div>
+      <div class="footer">
+        Uses WebRTC + PeerJS cloud signaling. Keep this tab open during the call.
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="small section-title">Connection Info</div>
+      <div class="row"><span class="badge">Mode: <span id="modeText">Waiting</span></span></div>
+      <div class="small">
+        If you opened this page normally, you’re the <strong>Host</strong>. Send the invite link to the other person.
+        If you opened it with <code>?call=XYZ</code>, you’re the <strong>Guest</strong> and it will dial the host.
+      </div>
+      <div class="small">
+        Works peer-to-peer when possible. If either side has strict firewalls, try a different network.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(async () => {
+  // ------ Helpers ------
+  const $ = (id) => document.getElementById(id);
+  const toast = (msg) => { const t=$('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(window.__toast); window.__toast=setTimeout(()=>t.style.display='none',2200); };
+  const q = new URLSearchParams(location.search);
+  const isGuest = q.has('call');
+  const callTargetId = q.get('call') || '';
+  const roleTextEl = $('roleText'), statusText = $('statusText'), idText = $('idText'), modeText = $('modeText');
+  roleTextEl.textContent = isGuest ? 'Guest' : 'Host';
+  $('roleBadge').style.background = isGuest ? '#1a2a12' : '#0f2033';
+
+  // ------ Media (camera/mic) ------
+  let localStream = null;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    $('localVideo').srcObject = localStream;
+    await $('localVideo').play().catch(()=>{});
+    statusText.textContent = 'Devices ready';
+  } catch (e) {
+    statusText.textContent = 'Camera/Mic blocked';
+    alert('Please allow camera and microphone to join the call.');
+    console.error(e);
+    return;
+  }
+
+  // ------ PeerJS (signaling) ------
+  const randomId = () => 'user-' + ([...crypto.getRandomValues(new Uint8Array(8))].map(b=>b.toString(16).padStart(2,'0')).join(''));
+  const myId = isGuest ? undefined : randomId();
+
+  const peer = new Peer(myId, {
+    host: '0.peerjs.com', port: 443, secure: true,
+    config: {
+      iceServers: [
+        { urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] }
+      ]
+    },
+    debug: 1
+  });
+
+  let currentCall = null;
+  let ended = false;
+
+  const updateInvite = (pid) => {
+    const url = new URL(location.href);
+    url.searchParams.set('call', pid);
+    $('inviteLink').textContent = url.toString();
+  };
+
+  peer.on('open', (id) => {
+    idText.textContent = id;
+    statusText.textContent = 'Ready';
+    if (!isGuest) {
+      updateInvite(id);
+      modeText.textContent = 'Hosting (waiting for guest)';
+    } else {
+      modeText.textContent = 'Guest (dialing host)';
+      startGuestCall();
+    }
+  });
+
+  peer.on('error', (err) => {
+    console.error(err);
+    statusText.textContent = 'Error';
+    toast('Connection error. Refresh and try again.');
+  });
+
+  // ------ Host: auto-answer incoming calls ------
+  peer.on('call', (call) => {
+    if (ended) return;
+    modeText.textContent = 'Incoming call…';
+    call.answer(localStream);
+    attachCall(call);
+  });
+
+  // ------ Guest: place the outgoing call ------
+  async function startGuestCall() {
+    if (!callTargetId) return;
+    try {
+      statusText.textContent = 'Calling…';
+      const call = peer.call(callTargetId, localStream, { metadata: { from: 'guest' } });
+      if (!call) throw new Error('Call failed to start');
+      attachCall(call);
+    } catch (e) {
+      console.error(e);
+      statusText.textContent = 'Call failed';
+      toast('Failed to start call. Check the link and try again.');
+    }
+  }
+
+  function attachCall(call) {
+    cleanupCall();
+    currentCall = call;
+    call.on('stream', async (remoteStream) => {
+      $('remoteVideo').srcObject = remoteStream;
+      await $('remoteVideo').play().catch(()=>{});
+      statusText.textContent = 'Connected';
+      modeText.textContent = isGuest ? 'In Call (Guest)' : 'In Call (Host)';
+    });
+    call.on('close', () => {
+      if (!ended) { statusText.textContent = 'Call ended'; modeText.textContent = 'Idle'; toast('Call ended'); }
+    });
+    call.on('error', (e) => {
+      console.error(e);
+      statusText.textContent = 'Call error';
+      toast('Call error');
+    });
+  }
+
+  function cleanupCall() {
+    if (currentCall) {
+      try { currentCall.close(); } catch {}
+      currentCall = null;
+    }
+  }
+
+  function endEverything() {
+    ended = true;
+    cleanupCall();
+    try { peer.destroy(); } catch {}
+    statusText.textContent = 'Ended';
+  }
+
+  // ------ Controls ------
+  let micOn = true, camOn = true;
+
+  $('btnMic').onclick = () => {
+    micOn = !micOn;
+    localStream.getAudioTracks().forEach(t => t.enabled = micOn);
+    $('btnMic').textContent = micOn ? '🎙️ Mute' : '🔇 Unmute';
+  };
+  $('btnCam').onclick = () => {
+    camOn = !camOn;
+    localStream.getVideoTracks().forEach(t => t.enabled = camOn);
+    $('btnCam').textContent = camOn ? '🎥 Camera Off' : '📷 Camera On';
+  };
+  $('btnHang').onclick = () => { endEverything(); toast('You left the call'); };
+
+  $('btnCopy').onclick = async () => {
+    try { await navigator.clipboard.writeText($('inviteLink').textContent); toast('Invite link copied'); }
+    catch { toast('Copy failed'); }
+  };
+
+  $('btnStart').onclick = () => {
+    if (isGuest && !currentCall && callTargetId) startGuestCall();
+    $('localVideo')?.play().catch(()=>{});
+    $('remoteVideo')?.play().catch(()=>{});
+    toast('Starting…');
+  };
+
+  // Warn on unload while connected
+  window.addEventListener('beforeunload', (e) => {
+    if (currentCall) { e.preventDefault(); e.returnValue = ''; }
+  });
+})();
+</script>
+</body>
+</html>
