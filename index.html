@@ -137,8 +137,14 @@
     host: '0.peerjs.com', port: 443, secure: true,
     config: {
       iceServers: [
-        { urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] }
+        { urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] },
+        { urls: ['stun:stun.cloudflare.com:3478'] },
+        { urls: ['stun:stun.stunprotocol.org:3478'] }
+        // To improve connectivity behind strict NATs, add a TURN server here:
+        // { urls: 'turn:YOUR_TURN_HOST:3478', username: 'YOUR_USER', credential: 'YOUR_PASSWORD' }
       ]
+      // If you add a TURN server and want to force relay, you can also set:
+      // iceTransportPolicy: 'all' // or 'relay'
     },
     debug: 1
   });
@@ -189,13 +195,52 @@
     } catch (e) {
       console.error(e);
       statusText.textContent = 'Call failed';
-      toast('Failed to start call. Check the link and try again.');
+      toast('Failed to start call. Retrying…');
+      retryGuestCall();
     }
+  }
+
+  // Retry/backoff logic for cases where host is not ready yet or transient network issues
+  let guestRetryCount = 0;
+  const maxGuestRetries = 5;
+  function retryGuestCall() {
+    if (!isGuest) return;
+    if (guestRetryCount >= maxGuestRetries) {
+      toast('Could not connect. Ensure host page is open and try again.');
+      modeText.textContent = 'Guest (unable to connect)';
+      return;
+    }
+    const backoffMs = Math.min(1500 * Math.pow(1.5, guestRetryCount), 8000);
+    guestRetryCount += 1;
+    setTimeout(() => {
+      statusText.textContent = `Retrying… (${guestRetryCount}/${maxGuestRetries})`;
+      startGuestCall();
+    }, backoffMs);
   }
 
   function attachCall(call) {
     cleanupCall();
     currentCall = call;
+
+    // Connection diagnostics to help identify network/ICE issues
+    try {
+      const pc = call.peerConnection || call._pc || call._peerConnection;
+      if (pc) {
+        pc.addEventListener('iceconnectionstatechange', () => {
+          const s = pc.iceConnectionState;
+          console.log('[ICE] iceConnectionState:', s);
+          modeText.textContent = `${isGuest ? 'Guest' : 'Host'} (${s})`;
+          if (s === 'failed' || s === 'disconnected') {
+            toast('Network issue. If this persists, try a different network or add a TURN server.');
+          }
+        });
+        pc.addEventListener('connectionstatechange', () => {
+          const s = pc.connectionState;
+          console.log('[ICE] connectionState:', s);
+        });
+      }
+    } catch {}
+
     call.on('stream', async (remoteStream) => {
       $('remoteVideo').srcObject = remoteStream;
       await $('remoteVideo').play().catch(()=>{});
@@ -209,6 +254,7 @@
       console.error(e);
       statusText.textContent = 'Call error';
       toast('Call error');
+      if (isGuest) retryGuestCall();
     });
   }
 
