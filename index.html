@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Quick Video Call</title>
+<title>Rob Video Call App</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64'%3E%3Ctext y='50' font-size='48'%3E%F0%9F%93%BA%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://unpkg.com">
 <style>
@@ -24,7 +24,7 @@
   .linkbox{display:flex;gap:8px;align-items:center;background:#0f1621;border:1px solid #1f2a38;border-radius:12px;padding:10px 12px;overflow:auto}
   .badge{display:inline-flex;align-items:center;gap:6px;background:#0f2033;border:1px solid #1f2a38;color:#c8e2ff;padding:6px 10px;border-radius:999px;font-size:.85rem}
   /* New classes extracted from inline styles */
-  .video-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px}
+  .video-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin:10px}
   .inner-card{min-height:200px;margin:10px}
   .row-controls{margin:4px 0 10px}
   .push-right{margin-left:auto}
@@ -52,16 +52,7 @@
 
   <div class="grid">
     <div class="card videos">
-      <div class="grid video-grid">
-        <div class="card inner-card">
-          <video id="localVideo" muted playsinline></video>
-          <div class="hint">You</div>
-        </div>
-        <div class="card inner-card">
-          <video id="remoteVideo" playsinline></video>
-          <div class="hint">Guest</div>
-        </div>
-      </div>
+      <div id="videoGrid" class="video-grid"></div>
     </div>
 
     <div class="card">
@@ -132,6 +123,7 @@
   // ------ PeerJS (signaling) ------
   const randomId = () => 'user-' + ([...crypto.getRandomValues(new Uint8Array(8))].map(b=>b.toString(16).padStart(2,'0')).join(''));
   const myId = isGuest ? undefined : randomId();
+  let myPeerId = undefined;
 
   const peer = new Peer(myId, {
     host: '0.peerjs.com', port: 443, secure: true,
@@ -149,8 +141,42 @@
     debug: 1
   });
 
-  let currentCall = null;
+  // Multi-party state
+  const mediaCalls = new Map(); // peerId -> MediaConnection
+  const videoEls = new Map();   // peerId|'self' -> HTMLVideoElement
+  const dataConns = new Map();  // peerId -> DataConnection (host only)
+  const participants = new Set(); // host tracks, guests read from roster
+  let hostDataConn = null; // guest -> host data channel
   let ended = false;
+
+  // Helpers for dynamic tiles
+  const videoGrid = document.getElementById('videoGrid');
+  function sanitizeId(id){ return String(id||'').replace(/[^a-zA-Z0-9_-]/g,''); }
+  function ensureTile(tileId, label, muted=false){
+    if (videoEls.has(tileId)) return videoEls.get(tileId);
+    const container = document.createElement('div');
+    container.className = 'card inner-card video-tile';
+    const vid = document.createElement('video');
+    vid.setAttribute('playsinline','');
+    if (muted) vid.muted = true;
+    vid.autoplay = false; // we will call play() in JS
+    vid.style.width = '100%';
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = label;
+    container.appendChild(vid);
+    container.appendChild(hint);
+    videoGrid.appendChild(container);
+    videoEls.set(tileId, vid);
+    return vid;
+  }
+  async function attachStreamToTile(tileId, label, stream, muted=false){
+    const vid = ensureTile(tileId, label, muted);
+    try {
+      if (vid.srcObject !== stream) vid.srcObject = stream;
+      await vid.play().catch(()=>{});
+    } catch {}
+  }
 
   const updateInvite = (pid) => {
     const url = new URL(location.href);
@@ -159,14 +185,30 @@
   };
 
   peer.on('open', (id) => {
+    myPeerId = id;
     idText.textContent = id;
     statusText.textContent = 'Ready';
     if (!isGuest) {
       updateInvite(id);
-      modeText.textContent = 'Hosting (waiting for guest)';
+      modeText.textContent = 'Hosting (waiting for guests)';
+      // Host: track self and broadcast roster when guests connect
+      participants.add(id);
     } else {
-      modeText.textContent = 'Guest (dialing host)';
-      startGuestCall();
+      modeText.textContent = 'Guest (connecting to host)';
+      // Guest: open data channel to host for roster
+      hostDataConn = peer.connect(callTargetId, { reliable: true });
+      hostDataConn.on('open', () => {
+        hostDataConn.send({ type: 'join', id });
+      });
+      hostDataConn.on('data', (msg) => {
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'roster' && Array.isArray(msg.ids)) {
+          // Call everyone listed except self
+          msg.ids.filter(pid => pid && pid !== myPeerId).forEach(pid => ensureOutgoingCall(pid));
+        }
+      });
+      hostDataConn.on('close', () => { console.warn('Host data connection closed'); });
+      hostDataConn.on('error', (e) => { console.error('Host data error', e); });
     }
   });
 
@@ -176,93 +218,91 @@
     toast('Connection error. Refresh and try again.');
   });
 
-  // ------ Host: auto-answer incoming calls ------
+  // ------ Media calls: handle incoming ------
   peer.on('call', (call) => {
     if (ended) return;
-    modeText.textContent = 'Incoming call…';
-    call.answer(localStream);
-    attachCall(call);
+    const pid = call.peer;
+    if (mediaCalls.has(pid)) {
+      // Already have a call; still answer to ensure flow, but keep map to latest
+      try { call.answer(localStream); } catch {}
+    } else {
+      try { call.answer(localStream); } catch {}
+    }
+    wireMediaCall(pid, call);
   });
 
-  // ------ Guest: place the outgoing call ------
-  async function startGuestCall() {
-    if (!callTargetId) return;
+  // ------ Host: accept data channels; track roster and broadcast ------
+  peer.on('connection', (conn) => {
+    if (ended) return;
+    if (isGuest) return; // only host coordinates roster
+    dataConns.set(conn.peer, conn);
+    conn.on('data', (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'join') {
+        participants.add(conn.peer);
+        broadcastRoster();
+      }
+    });
+    conn.on('close', () => {
+      participants.delete(conn.peer);
+      dataConns.delete(conn.peer);
+      broadcastRoster();
+    });
+    conn.on('error', () => {
+      // Keep going; next broadcast will refresh
+    });
+    // Send initial roster
+    broadcastRoster();
+  });
+
+  function broadcastRoster(){
+    if (isGuest) return;
+    const ids = Array.from(participants);
+    dataConns.forEach(dc => { try { dc.send({ type:'roster', ids }); } catch {} });
+  }
+
+  // ------ Outgoing media calls to a specific peer ------
+  function ensureOutgoingCall(pid){
+    if (pid === myPeerId) return;
+    if (mediaCalls.has(pid)) return;
     try {
-      statusText.textContent = 'Calling…';
-      const call = peer.call(callTargetId, localStream, { metadata: { from: 'guest' } });
-      if (!call) throw new Error('Call failed to start');
-      attachCall(call);
+      const call = peer.call(pid, localStream, { metadata: { from: isGuest ? 'guest' : 'host' } });
+      if (!call) return;
+      wireMediaCall(pid, call);
     } catch (e) {
-      console.error(e);
-      statusText.textContent = 'Call failed';
-      toast('Failed to start call. Retrying…');
-      retryGuestCall();
+      console.error('Call start error to', pid, e);
     }
   }
 
-  // Retry/backoff logic for cases where host is not ready yet or transient network issues
-  let guestRetryCount = 0;
-  const maxGuestRetries = 5;
-  function retryGuestCall() {
-    if (!isGuest) return;
-    if (guestRetryCount >= maxGuestRetries) {
-      toast('Could not connect. Ensure host page is open and try again.');
-      modeText.textContent = 'Guest (unable to connect)';
-      return;
-    }
-    const backoffMs = Math.min(1500 * Math.pow(1.5, guestRetryCount), 8000);
-    guestRetryCount += 1;
-    setTimeout(() => {
-      statusText.textContent = `Retrying… (${guestRetryCount}/${maxGuestRetries})`;
-      startGuestCall();
-    }, backoffMs);
-  }
-
-  function attachCall(call) {
-    cleanupCall();
-    currentCall = call;
-
-    // Connection diagnostics to help identify network/ICE issues
+  // Shared media call wiring
+  function wireMediaCall(pid, call){
+    // Keep latest call reference
+    mediaCalls.set(pid, call);
+    call.on('stream', async (remoteStream) => {
+      await attachStreamToTile(pid, pid, remoteStream, false);
+      statusText.textContent = 'Connected';
+    });
+    // Diagnostics
     try {
       const pc = call.peerConnection || call._pc || call._peerConnection;
       if (pc) {
         pc.addEventListener('iceconnectionstatechange', () => {
           const s = pc.iceConnectionState;
-          console.log('[ICE] iceConnectionState:', s);
-          modeText.textContent = `${isGuest ? 'Guest' : 'Host'} (${s})`;
-          if (s === 'failed' || s === 'disconnected') {
-            toast('Network issue. If this persists, try a different network or add a TURN server.');
-          }
-        });
-        pc.addEventListener('connectionstatechange', () => {
-          const s = pc.connectionState;
-          console.log('[ICE] connectionState:', s);
+          console.log('[ICE]', pid, 'iceConnectionState:', s);
         });
       }
     } catch {}
-
-    call.on('stream', async (remoteStream) => {
-      $('remoteVideo').srcObject = remoteStream;
-      await $('remoteVideo').play().catch(()=>{});
-      statusText.textContent = 'Connected';
-      modeText.textContent = isGuest ? 'In Call (Guest)' : 'In Call (Host)';
-    });
     call.on('close', () => {
-      if (!ended) { statusText.textContent = 'Call ended'; modeText.textContent = 'Idle'; toast('Call ended'); }
+      mediaCalls.delete(pid);
     });
     call.on('error', (e) => {
-      console.error(e);
-      statusText.textContent = 'Call error';
-      toast('Call error');
-      if (isGuest) retryGuestCall();
+      console.error('Call error with', pid, e);
     });
   }
 
   function cleanupCall() {
-    if (currentCall) {
-      try { currentCall.close(); } catch {}
-      currentCall = null;
-    }
+    mediaCalls.forEach((c) => { try { c.close(); } catch {} });
+    mediaCalls.clear();
   }
 
   function endEverything() {
@@ -293,16 +333,18 @@
   };
 
   $('btnStart').onclick = () => {
-    if (isGuest && !currentCall && callTargetId) startGuestCall();
-    $('localVideo')?.play().catch(()=>{});
-    $('remoteVideo')?.play().catch(()=>{});
+    // Kick autoplay on all tiles
+    videoEls.forEach(v => v.play().catch(()=>{}));
     toast('Starting…');
   };
 
   // Warn on unload while connected
   window.addEventListener('beforeunload', (e) => {
-    if (currentCall) { e.preventDefault(); e.returnValue = ''; }
+    if (mediaCalls.size > 0) { e.preventDefault(); e.returnValue = ''; }
   });
+
+  // Add local video tile immediately
+  await attachStreamToTile('self', 'You', localStream, true);
 })();
 </script>
 </body>
