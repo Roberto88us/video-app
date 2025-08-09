@@ -58,6 +58,7 @@
     <div class="card">
       <div class="row row-controls">
         <button class="pill push-right" id="btnStart" type="button">▶️ Join / Start</button>
+        <button class="pill" id="btnRetry" type="button">🔁 Retry Devices</button>
         <button class="pill" id="btnMic" type="button">🎙️ Mute</button>
         <button class="pill" id="btnCam" type="button">🎥 Camera Off</button>
         <button class="pill" id="btnHang" type="button">⛔ End Call</button>
@@ -105,19 +106,47 @@
 
   // ------ Media (camera/mic) ------
   let localStream = null;
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
+  async function ensureLocalStream() {
+    if (localStream) return localStream;
+    statusText.textContent = 'Requesting devices…';
+    const constraintsPrimary = {
       video: { width: { ideal: 1280 }, height: { ideal: 720 } },
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-    $('localVideo').srcObject = localStream;
-    await $('localVideo').play().catch(()=>{});
-    statusText.textContent = 'Devices ready';
-  } catch (e) {
-    statusText.textContent = 'Camera/Mic blocked';
-    alert('Please allow camera and microphone to join the call.');
-    console.error(e);
-    return;
+    };
+    const constraintsVideoOnly = { video: true, audio: false };
+    const constraintsAudioOnly = { video: false, audio: true };
+
+    const errors = [];
+    for (const c of [constraintsPrimary, constraintsVideoOnly, constraintsAudioOnly]) {
+      try {
+        const s = await navigator.mediaDevices.getUserMedia(c);
+        localStream = s;
+        await attachStreamToTile('self', 'You', localStream, true);
+        statusText.textContent = 'Devices ready';
+        return localStream;
+      } catch (e) {
+        errors.push(e);
+        console.warn('getUserMedia failed with', c, e);
+      }
+    }
+
+    // Permissions diagnostics
+    try {
+      if (navigator.permissions) {
+        const cam = await navigator.permissions.query({ name: 'camera' }).catch(()=>null);
+        const mic = await navigator.permissions.query({ name: 'microphone' }).catch(()=>null);
+        const camState = cam?.state || 'unknown';
+        const micState = mic?.state || 'unknown';
+        statusText.textContent = `Device error (cam: ${camState}, mic: ${micState})`;
+      } else {
+        statusText.textContent = 'Device error';
+      }
+    } catch {
+      statusText.textContent = 'Device error';
+    }
+    const last = errors[errors.length-1];
+    toast(`Devices failed (${last?.name || 'unknown'}). Click Retry Devices.`);
+    throw last || new Error('Devices failed');
   }
 
   // ------ PeerJS (signaling) ------
@@ -187,28 +216,29 @@
   peer.on('open', (id) => {
     myPeerId = id;
     idText.textContent = id;
-    statusText.textContent = 'Ready';
     if (!isGuest) {
+      statusText.textContent = 'Ready';
       updateInvite(id);
       modeText.textContent = 'Hosting (waiting for guests)';
-      // Host: track self and broadcast roster when guests connect
       participants.add(id);
     } else {
+      statusText.textContent = 'Ready (click Join)';
       modeText.textContent = 'Guest (connecting to host)';
       // Guest: open data channel to host for roster
-      hostDataConn = peer.connect(callTargetId, { reliable: true });
-      hostDataConn.on('open', () => {
-        hostDataConn.send({ type: 'join', id });
-      });
-      hostDataConn.on('data', (msg) => {
-        if (!msg || typeof msg !== 'object') return;
-        if (msg.type === 'roster' && Array.isArray(msg.ids)) {
-          // Call everyone listed except self
-          msg.ids.filter(pid => pid && pid !== myPeerId).forEach(pid => ensureOutgoingCall(pid));
-        }
-      });
-      hostDataConn.on('close', () => { console.warn('Host data connection closed'); });
-      hostDataConn.on('error', (e) => { console.error('Host data error', e); });
+      if (callTargetId) {
+        hostDataConn = peer.connect(callTargetId, { reliable: true });
+        hostDataConn.on('open', () => {
+          hostDataConn.send({ type: 'join', id });
+        });
+        hostDataConn.on('data', (msg) => {
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type === 'roster' && Array.isArray(msg.ids)) {
+            msg.ids.filter(pid => pid && pid !== myPeerId).forEach(pid => ensureOutgoingCall(pid));
+          }
+        });
+        hostDataConn.on('close', () => { console.warn('Host data connection closed'); });
+        hostDataConn.on('error', (e) => { console.error('Host data error', e); });
+      }
     }
   });
 
@@ -219,16 +249,17 @@
   });
 
   // ------ Media calls: handle incoming ------
-  peer.on('call', (call) => {
+  peer.on('call', async (call) => {
     if (ended) return;
-    const pid = call.peer;
-    if (mediaCalls.has(pid)) {
-      // Already have a call; still answer to ensure flow, but keep map to latest
-      try { call.answer(localStream); } catch {}
-    } else {
-      try { call.answer(localStream); } catch {}
+    try {
+      await ensureLocalStream();
+    } catch {
+      // Cannot answer without media
+      toast('Allow camera/mic to answer the call');
+      return;
     }
-    wireMediaCall(pid, call);
+    try { call.answer(localStream); } catch {}
+    wireMediaCall(call.peer, call);
   });
 
   // ------ Host: accept data channels; track roster and broadcast ------
@@ -248,10 +279,7 @@
       dataConns.delete(conn.peer);
       broadcastRoster();
     });
-    conn.on('error', () => {
-      // Keep going; next broadcast will refresh
-    });
-    // Send initial roster
+    conn.on('error', () => {});
     broadcastRoster();
   });
 
@@ -262,10 +290,11 @@
   }
 
   // ------ Outgoing media calls to a specific peer ------
-  function ensureOutgoingCall(pid){
+  async function ensureOutgoingCall(pid){
     if (pid === myPeerId) return;
     if (mediaCalls.has(pid)) return;
     try {
+      await ensureLocalStream();
       const call = peer.call(pid, localStream, { metadata: { from: isGuest ? 'guest' : 'host' } });
       if (!call) return;
       wireMediaCall(pid, call);
@@ -276,13 +305,11 @@
 
   // Shared media call wiring
   function wireMediaCall(pid, call){
-    // Keep latest call reference
     mediaCalls.set(pid, call);
     call.on('stream', async (remoteStream) => {
       await attachStreamToTile(pid, pid, remoteStream, false);
       statusText.textContent = 'Connected';
     });
-    // Diagnostics
     try {
       const pc = call.peerConnection || call._pc || call._peerConnection;
       if (pc) {
@@ -292,12 +319,8 @@
         });
       }
     } catch {}
-    call.on('close', () => {
-      mediaCalls.delete(pid);
-    });
-    call.on('error', (e) => {
-      console.error('Call error with', pid, e);
-    });
+    call.on('close', () => { mediaCalls.delete(pid); });
+    call.on('error', (e) => { console.error('Call error with', pid, e); });
   }
 
   function cleanupCall() {
@@ -317,22 +340,32 @@
 
   $('btnMic').onclick = () => {
     micOn = !micOn;
-    localStream.getAudioTracks().forEach(t => t.enabled = micOn);
+    localStream?.getAudioTracks().forEach(t => t.enabled = micOn);
     $('btnMic').textContent = micOn ? '🎙️ Mute' : '🔇 Unmute';
   };
   $('btnCam').onclick = () => {
     camOn = !camOn;
-    localStream.getVideoTracks().forEach(t => t.enabled = camOn);
+    localStream?.getVideoTracks().forEach(t => t.enabled = camOn);
     $('btnCam').textContent = camOn ? '🎥 Camera Off' : '📷 Camera On';
   };
   $('btnHang').onclick = () => { endEverything(); toast('You left the call'); };
+  $('btnRetry').onclick = async () => {
+    try {
+      // stop previous stream if any
+      localStream?.getTracks().forEach(t => { try { t.stop(); } catch {} });
+      localStream = null;
+      await ensureLocalStream();
+      toast('Devices ready');
+    } catch {}
+  };
 
   $('btnCopy').onclick = async () => {
     try { await navigator.clipboard.writeText($('inviteLink').textContent); toast('Invite link copied'); }
     catch { toast('Copy failed'); }
   };
 
-  $('btnStart').onclick = () => {
+  $('btnStart').onclick = async () => {
+    try { await ensureLocalStream(); } catch {}
     // Kick autoplay on all tiles
     videoEls.forEach(v => v.play().catch(()=>{}));
     toast('Starting…');
@@ -342,9 +375,6 @@
   window.addEventListener('beforeunload', (e) => {
     if (mediaCalls.size > 0) { e.preventDefault(); e.returnValue = ''; }
   });
-
-  // Add local video tile immediately
-  await attachStreamToTile('self', 'You', localStream, true);
 })();
 </script>
 </body>
